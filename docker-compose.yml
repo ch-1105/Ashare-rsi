@@ -1,0 +1,16 @@
+version: "3.8"
+
+services:
+  a-share-rsi-bot:
+    build: .
+    container_name: a-share-rsi-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

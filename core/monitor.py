@@ -50,6 +50,10 @@ class MonitorScheduler:
             task = asyncio.create_task(self._monitor_loop(interval))
             self.tasks.append(task)
         
+        # 启动收盘日报任务
+        daily_report_task = asyncio.create_task(self._daily_report_loop())
+        self.tasks.append(daily_report_task)
+        
         logger.info("✅ A股监控调度器已启动")
     
     async def stop(self):
@@ -111,7 +115,9 @@ class MonitorScheduler:
             await asyncio.sleep(check_interval)
     
     async def _check_stocks(self, codes: List[str], interval: int):
-        """检查指定股票的 RSI"""
+        """检查指定股票的 RSI 和背离"""
+        from core.divergence import DivergenceDetector
+        
         period_map = {30: '30', 60: '60', 1440: 'daily'}
         period = period_map.get(interval, '30')
         
@@ -132,10 +138,13 @@ class MonitorScheduler:
                 
                 current_price = df['close'].iloc[-1]
                 
+                # 检测背离
+                divergence = DivergenceDetector.detect_divergence_from_kline(df)
+                
                 # 检查所有相关订阅
                 for (user_id, c), config in self.subscription_configs.items():
                     if c == code and config['interval'] == interval:
-                        await self._check_and_notify(config, rsi_value, current_price)
+                        await self._check_and_notify(config, rsi_value, current_price, divergence)
                 
                 # 请求间隔，避免被限流
                 await asyncio.sleep(1)
@@ -143,7 +152,7 @@ class MonitorScheduler:
             except Exception as e:
                 logger.error(f"检查股票失败 ({code}): {e}")
     
-    async def _check_and_notify(self, config, rsi_value, current_price):
+    async def _check_and_notify(self, config, rsi_value, current_price, divergence=None):
         """检查阈值并发送通知"""
         user_id = config['user_id']
         code = config['stock_code']
@@ -155,15 +164,26 @@ class MonitorScheduler:
         signal_type = None
         emoji = ""
         direction = ""
+        trading_hint = ""
         
         if rsi_value <= rsi_lower:
             signal_type = "oversold"
             emoji = "🟢"
             direction = "超卖"
+            trading_hint = (
+                "💡 *信号解读*: 股价可能处于相对低位，RSI 进入超卖区间，"
+                "可关注是否出现企稳反弹信号。\n\n"
+                "⚠️ *注意*: A股实行 T+1 制度，当日买入次日方可卖出，请控制仓位。"
+            )
         elif rsi_value >= rsi_upper:
             signal_type = "overbought"
             emoji = "🔴"
             direction = "超买"
+            trading_hint = (
+                "💡 *信号解读*: 股价可能处于相对高位，RSI 进入超买区间，"
+                "需警惕短期回调风险。\n\n"
+                "⚠️ *注意*: 如已持仓，可考虑分批止盈；切勿追高。"
+            )
         
         if signal_type:
             # 检查通知冷却
@@ -179,6 +199,17 @@ class MonitorScheduler:
             # 周期描述
             interval_desc = {30: '30分钟', 60: '60分钟', 1440: '日线'}.get(interval, f'{interval}分钟')
             
+            # 生成东方财富 K 线链接
+            market_id = "1" if code.startswith(('6', '5')) else "0"
+            kline_url = f"https://quote.eastmoney.com/{market_id}{code}.html"
+            
+            # 背离信息
+            divergence_text = ""
+            if divergence:
+                div_type = "📈 看涨信号增强!" if divergence['type'] == 'bullish' else "📉 看跌信号增强!"
+                strength_text = "(强背离)" if divergence['strength'] == 'strong' else "(弱背离)"
+                divergence_text = f"\n\n🔄 *技术形态*: {divergence['description']}\n{div_type} {strength_text}"
+            
             # 发送通知
             message = (
                 f"{emoji} **{name}** ({code}) {direction}信号!\n\n"
@@ -186,13 +217,17 @@ class MonitorScheduler:
                 f"💰 价格: {format_price(current_price)}\n"
                 f"⏱️ 周期: {interval_desc}\n"
                 f"⏰ {now.strftime('%Y-%m-%d %H:%M:%S')}"
+                f"{divergence_text}\n\n"
+                f"{trading_hint}\n\n"
+                f"📈 [查看K线图]({kline_url})"
             )
             
             try:
                 await self.bot_app.bot.send_message(
                     chat_id=user_id,
                     text=message,
-                    parse_mode='Markdown'
+                    parse_mode='Markdown',
+                    disable_web_page_preview=True
                 )
                 logger.info(f"✉️ 已发送 {signal_type} 通知给用户 {user_id}: {name}")
             except Exception as e:
@@ -238,3 +273,86 @@ class MonitorScheduler:
             logger.error(f"获取最新 RSI 失败 ({code}): {e}")
         
         return None, None, None
+    
+    async def _daily_report_loop(self):
+        """收盘日报循环 - 每天 15:05 发送"""
+        from datetime import time as dt_time
+        from core.market_time import is_trading_day
+        from core.resonance import ResonanceDetector
+        
+        REPORT_TIME = dt_time(15, 5)
+        
+        while self.running:
+            try:
+                now = datetime.now()
+                current_time = now.time()
+                
+                # 检查是否是交易日的 15:05
+                if is_trading_day(now) and current_time.hour == 15 and 5 <= current_time.minute <= 6:
+                    # 发送日报
+                    await self._send_daily_report()
+                    # 等待 2 分钟避免重复发送
+                    await asyncio.sleep(120)
+                else:
+                    # 每分钟检查一次
+                    await asyncio.sleep(60)
+                    
+            except Exception as e:
+                logger.error(f"日报循环出错: {e}")
+                await asyncio.sleep(60)
+    
+    async def _send_daily_report(self):
+        """发送收盘日报"""
+        from core.resonance import ResonanceDetector
+        
+        # 按用户分组
+        user_stocks = defaultdict(list)
+        for (user_id, code), config in self.subscription_configs.items():
+            user_stocks[user_id].append(config)
+        
+        for user_id, stocks in user_stocks.items():
+            try:
+                lines = ["📊 *A股收盘日报*\n"]
+                lines.append(f"📅 {datetime.now().strftime('%Y-%m-%d')}\n")
+                
+                for stock in stocks:
+                    code = stock['stock_code']
+                    name = stock.get('stock_name') or code
+                    interval = stock['interval']
+                    
+                    price, rsi, change_pct = await self.get_latest_rsi(code, interval)
+                    
+                    if rsi is not None:
+                        # RSI 状态表情
+                        if rsi <= 30:
+                            rsi_emoji = "🟢"
+                        elif rsi >= 70:
+                            rsi_emoji = "🔴"
+                        else:
+                            rsi_emoji = "⚪"
+                        
+                        change_str = format_change(change_pct) if change_pct is not None else ""
+                        lines.append(f"• *{name}* | {format_price(price)} {change_str}")
+                        lines.append(f"  {rsi_emoji} RSI: {rsi:.1f}\n")
+                    else:
+                        lines.append(f"• *{name}* | 数据获取中...\n")
+                
+                # 检查是否有多周期共振
+                unique_codes = set(s['stock_code'] for s in stocks)
+                for code in unique_codes:
+                    rsi_by_interval = await ResonanceDetector.get_multi_period_rsi(code)
+                    resonance = ResonanceDetector.check_resonance(rsi_by_interval)
+                    if resonance:
+                        lines.append(f"\n{resonance['description']}")
+                
+                message = "\n".join(lines)
+                
+                await self.bot_app.bot.send_message(
+                    chat_id=user_id,
+                    text=message,
+                    parse_mode='Markdown'
+                )
+                logger.info(f"📨 已发送日报给用户 {user_id}")
+                
+            except Exception as e:
+                logger.error(f"发送日报失败 (用户 {user_id}): {e}")

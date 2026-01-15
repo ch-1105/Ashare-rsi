@@ -22,11 +22,26 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=getattr(logging, LOG_LEVEL, logging.INFO)
 )
+# 降低 httpx 等库的日志级别，避免请求日志刷屏
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 logger = logging.getLogger(__name__)
 
 
 async def post_init(app: Application):
     """应用初始化后的钩子"""
+    # 设置 Bot 菜单命令
+    from telegram import BotCommand
+    commands = [
+        BotCommand("start", "🏠 显示主菜单"),
+        BotCommand("add", "➕ 添加股票监控"),
+        BotCommand("list", "📋 查看所有监控"),
+        BotCommand("manage", "⚙️ 管理监控股票"),
+        BotCommand("status", "📊 查看市场状态"),
+    ]
+    await app.bot.set_my_commands(commands)
+    
     # 初始化数据库
     await init_db()
     
